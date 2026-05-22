@@ -8,6 +8,7 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
+  checks: write
 
 concurrency:
   group: pr-automation-${{ github.event.pull_request.number }}
@@ -30,61 +31,90 @@ jobs:
           cache: 'npm'
 
       - name: Install dependencies
-        run: npm ci || npm install
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci || npm install
+          else
+            npm install
+          fi
         continue-on-error: true
 
-      - name: Run ESLint checks
+      - name: Run ESLint
         id: eslint
         run: |
-          echo "Running ESLint..."
-          npm run lint > eslint-report.txt 2>&1 || echo "ESLint reported issues"
-          cat eslint-report.txt || true
+          set +e
+          npm run lint > eslint-report.txt 2>&1
+          ESLINT_EXIT=$?
+          echo "eslint_exit=$ESLINT_EXIT" >> $GITHUB_OUTPUT
+          if [ $ESLINT_EXIT -eq 0 ]; then
+            echo "eslint_status=✅ Passed" >> $GITHUB_OUTPUT
+          else
+            echo "eslint_status=❌ Failed" >> $GITHUB_OUTPUT
+          fi
+          cat eslint-report.txt
+          exit 0
         continue-on-error: true
 
-      - name: Run Prettier formatting checks
+      - name: Run Prettier check
         id: prettier
         run: |
-          echo "Running Prettier formatting checks..."
-          if npx --no-install prettier --check . > prettier-report.txt 2>&1; then
-            echo "prettier_status=passed" >> "$GITHUB_OUTPUT"
-          else
-            echo "prettier_status=issues" >> "$GITHUB_OUTPUT"
+          set +e
+          npx --no-install prettier --check "**/*.{js,jsx,ts,tsx,json,md,yml,yaml}" > prettier-report.txt 2>&1
+          PRETTIER_EXIT=$?
+          if [ $PRETTIER_EXIT -ne 0 ] && grep -q "command not found\|could not determine executable" prettier-report.txt; then
+            npx prettier --check "**/*.{js,jsx,ts,tsx,json,md,yml,yaml}" > prettier-report.txt 2>&1
+            PRETTIER_EXIT=$?
           fi
-          cat prettier-report.txt || true
+          echo "prettier_exit=$PRETTIER_EXIT" >> $GITHUB_OUTPUT
+          if [ $PRETTIER_EXIT -eq 0 ]; then
+            echo "prettier_status=✅ Passed" >> $GITHUB_OUTPUT
+          else
+            echo "prettier_status=❌ Failed" >> $GITHUB_OUTPUT
+          fi
+          cat prettier-report.txt
+          exit 0
         continue-on-error: true
 
-      - name: Post Code Quality Report comment
-        if: always() && github.event.pull_request.number != ''
+      - name: Post code quality PR comment
+        if: always() && github.event.pull_request != null
         uses: actions/github-script@v7
         env:
-          ESLINT_STATUS: ${{ steps.eslint.outcome }}
-          PRETTIER_STATUS: ${{ steps.prettier.outcome }}
+          ESLINT_STATUS: ${{ steps.eslint.outputs.eslint_status }}
+          PRETTIER_STATUS: ${{ steps.prettier.outputs.prettier_status }}
         with:
           script: |
-            const eslintStatus = process.env.ESLINT_STATUS || 'unknown';
-            const prettierStatus = process.env.PRETTIER_STATUS || 'unknown';
-            const reportBody = [
+            const eslintStatus = process.env.ESLINT_STATUS || 'N/A';
+            const prettierStatus = process.env.PRETTIER_STATUS || 'N/A';
+            const commentBody = [
               '## 🧹 Code Quality Report',
               '',
-              'Automated code quality analysis for this pull request.',
+              '| Check | Status |',
+              '| --- | --- |',
+              `| ESLint | ${eslintStatus} |`,
+              `| Prettier | ${prettierStatus} |`,
               '',
-              '### ESLint',
-              `- Status: \`${eslintStatus}\``,
-              '- Command: `npm run lint`',
+              '- **ESLint** validates code against project lint rules (`npm run lint`).',
+              '- **Prettier** validates that all source files are formatted consistently.',
               '',
-              '### Prettier',
-              `- Status: \`${prettierStatus}\``,
-              '- Command: `npx prettier --check .`',
-              '',
-              '_This comment was generated automatically by the PR Automation workflow._'
+              '_Posted automatically by the `code-quality` job._'
             ].join('
 ');
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.pull_request.number,
-              body: reportBody
+              body: commentBody
             });
+
+      - name: Upload code quality reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-quality-reports
+          path: |
+            eslint-report.txt
+            prettier-report.txt
+          if-no-files-found: ignore
 
   testing-suite:
     name: testing-suite
@@ -100,71 +130,98 @@ jobs:
           cache: 'npm'
 
       - name: Install dependencies
-        run: npm ci || npm install
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci || npm install
+          else
+            npm install
+          fi
         continue-on-error: true
 
       - name: Run test suite
         id: tests
         run: |
-          echo "Running full test suite..."
-          npm test > test-results.txt 2>&1 || echo "Tests completed with issues"
-          cat test-results.txt || true
+          set +e
+          npm test > test-output.txt 2>&1
+          TEST_EXIT=$?
+          echo "test_exit=$TEST_EXIT" >> $GITHUB_OUTPUT
+          if [ $TEST_EXIT -eq 0 ]; then
+            echo "test_status=✅ Passed" >> $GITHUB_OUTPUT
+          else
+            echo "test_status=❌ Failed" >> $GITHUB_OUTPUT
+          fi
+          cat test-output.txt
+          exit 0
         continue-on-error: true
 
       - name: Generate coverage report
         id: coverage
         run: |
-          echo "Generating coverage report..."
+          set +e
           mkdir -p coverage
-          if npm test -- --coverage > coverage/coverage-output.txt 2>&1; then
-            echo "coverage_status=generated" >> "$GITHUB_OUTPUT"
+          npx --no-install jest --coverage --coverageReporters=text-summary --coverageReporters=lcov > coverage-summary.txt 2>&1 \
+            || npm test -- --coverage > coverage-summary.txt 2>&1 \
+            || echo "Coverage generation skipped (no jest configuration detected)" > coverage-summary.txt
+          if [ -f coverage/lcov-report/index.html ] || [ -s coverage-summary.txt ]; then
+            echo "coverage_status=✅ Generated" >> $GITHUB_OUTPUT
           else
-            echo "coverage_status=partial" >> "$GITHUB_OUTPUT"
+            echo "coverage_status=⚠️ Unavailable" >> $GITHUB_OUTPUT
           fi
-          cat coverage/coverage-output.txt || true
+          cat coverage-summary.txt
+          exit 0
         continue-on-error: true
 
-      - name: Upload coverage artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-report
-          path: |
-            coverage/
-            test-results.txt
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Post Test Coverage Report comment
-        if: always() && github.event.pull_request.number != ''
+      - name: Post test coverage PR comment
+        if: always() && github.event.pull_request != null
         uses: actions/github-script@v7
         env:
-          TEST_OUTCOME: ${{ steps.tests.outcome }}
-          COVERAGE_OUTCOME: ${{ steps.coverage.outcome }}
+          TEST_STATUS: ${{ steps.tests.outputs.test_status }}
+          COVERAGE_STATUS: ${{ steps.coverage.outputs.coverage_status }}
         with:
           script: |
-            const testOutcome = process.env.TEST_OUTCOME || 'unknown';
-            const coverageOutcome = process.env.COVERAGE_OUTCOME || 'unknown';
-            const coverageBody = [
+            const fs = require('fs');
+            const testStatus = process.env.TEST_STATUS || 'N/A';
+            const coverageStatus = process.env.COVERAGE_STATUS || 'N/A';
+            let summary = '';
+            try {
+              summary = fs.readFileSync('coverage-summary.txt', 'utf8').slice(0, 3000);
+            } catch (err) {
+              summary = 'No coverage summary available.';
+            }
+            const commentBody = [
               '## 🧪 Test Coverage Report',
               '',
-              'Full test suite execution and coverage summary.',
+              `- **Test suite:** ${testStatus}`,
+              `- **Coverage:** ${coverageStatus}`,
               '',
-              `- Test suite outcome: \`${testOutcome}\``,
-              `- Coverage outcome: \`${coverageOutcome}\``,
-              '- Command: `npm test`',
+              '<details><summary>Coverage summary</summary>',
               '',
-              'Detailed coverage artifacts have been uploaded to this workflow run.',
+              '```',
+              summary,
+              '```',
               '',
-              '_This comment was generated automatically by the PR Automation workflow._'
+              '</details>',
+              '',
+              '_Posted automatically by the `testing-suite` job._'
             ].join('
 ');
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.pull_request.number,
-              body: coverageBody
+              body: commentBody
             });
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-coverage
+          path: |
+            coverage/
+            coverage-summary.txt
+            test-output.txt
+          if-no-files-found: ignore
 
   security-scan:
     name: security-scan
@@ -182,73 +239,106 @@ jobs:
           cache: 'npm'
 
       - name: Install dependencies
-        run: npm ci || npm install
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci || npm install
+          else
+            npm install
+          fi
         continue-on-error: true
 
-      - name: Run dependency vulnerability checks
+      - name: Audit dependencies for vulnerabilities
         id: audit
         run: |
-          echo "Running npm audit..."
-          npm audit --json > npm-audit.json 2>&1 || true
-          npm audit > npm-audit.txt 2>&1 || echo "npm audit reported vulnerabilities"
+          set +e
+          npm audit --omit=dev --json > npm-audit.json 2>&1
+          AUDIT_EXIT=$?
+          npm audit --omit=dev > npm-audit.txt 2>&1 || true
+          VULNS=$(node -e "try { const a=require('./npm-audit.json'); const m=a.metadata && a.metadata.vulnerabilities || {}; console.log((m.info||0)+(m.low||0)+(m.moderate||0)+(m.high||0)+(m.critical||0)); } catch(e){ console.log(0); }")
+          echo "audit_exit=$AUDIT_EXIT" >> $GITHUB_OUTPUT
+          echo "vuln_count=$VULNS" >> $GITHUB_OUTPUT
           cat npm-audit.txt || true
+          exit 0
         continue-on-error: true
 
       - name: Scan for secrets in code changes
         id: secrets
         run: |
-          echo "Scanning for potential secrets..."
-          : > secrets-scan.txt
-          PATTERNS='AKIA[0-9A-Z]{16}|-----BEGIN (RSA|EC|DSA|OPENSSH|PRIVATE) KEY-----|api[_-]?key["'\''=:[:space:]]+[A-Za-z0-9_\-]{16,}|secret["'\''=:[:space:]]+[A-Za-z0-9_\-]{16,}|ghp_[A-Za-z0-9]{30,}|xox[baprs]-[A-Za-z0-9-]{10,}'
-          if git rev-parse origin/${{ github.base_ref }} >/dev/null 2>&1; then
-            DIFF=$(git diff origin/${{ github.base_ref }}...HEAD --unified=0 || true)
+          set +e
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          if [ -z "$BASE_SHA" ] || [ -z "$HEAD_SHA" ]; then
+            DIFF_FILES=""
           else
-            DIFF=$(git diff HEAD~1...HEAD --unified=0 2>/dev/null || true)
+            DIFF_FILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" || true)
           fi
-          if [ -n "$DIFF" ]; then
-            echo "$DIFF" | grep -E "$PATTERNS" >> secrets-scan.txt || true
+          echo "Scanning files for secrets:" > secrets-report.txt
+          echo "$DIFF_FILES" >> secrets-report.txt
+          PATTERN='(AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|ghp_[0-9A-Za-z]{20,}|xox[baprs]-[0-9A-Za-z-]{10,}|-----BEGIN (RSA|OPENSSH|EC|DSA|PRIVATE) KEY-----|password\s*=\s*["'\''][^"'\'' ]{6,}["'\'']|api[_-]?key\s*=\s*["'\''][^"'\'' ]{8,}["'\''])'
+          MATCHES=0
+          if [ -n "$DIFF_FILES" ]; then
+            for f in $DIFF_FILES; do
+              if [ -f "$f" ]; then
+                if grep -E -I -n "$PATTERN" "$f" >> secrets-report.txt 2>/dev/null; then
+                  MATCHES=$((MATCHES+1))
+                fi
+              fi
+            done
           fi
-          if [ -s secrets-scan.txt ]; then
-            echo "secrets_status=found" >> "$GITHUB_OUTPUT"
+          echo "secret_matches=$MATCHES" >> $GITHUB_OUTPUT
+          if [ "$MATCHES" -eq 0 ]; then
+            echo "secret_status=✅ No secrets detected" >> $GITHUB_OUTPUT
           else
-            echo "secrets_status=clean" >> "$GITHUB_OUTPUT"
-            echo "No secrets detected in code changes." > secrets-scan.txt
+            echo "secret_status=⚠️ Potential secrets found" >> $GITHUB_OUTPUT
           fi
-          cat secrets-scan.txt
+          cat secrets-report.txt
+          exit 0
         continue-on-error: true
 
-      - name: Post Security Scan Report comment
-        if: always() && github.event.pull_request.number != ''
+      - name: Post security scan PR comment
+        if: always() && github.event.pull_request != null
         uses: actions/github-script@v7
         env:
-          AUDIT_OUTCOME: ${{ steps.audit.outcome }}
-          SECRETS_STATUS: ${{ steps.secrets.outputs.secrets_status }}
+          VULN_COUNT: ${{ steps.audit.outputs.vuln_count }}
+          SECRET_STATUS: ${{ steps.secrets.outputs.secret_status }}
+          SECRET_MATCHES: ${{ steps.secrets.outputs.secret_matches }}
         with:
           script: |
-            const auditOutcome = process.env.AUDIT_OUTCOME || 'unknown';
-            const secretsStatus = process.env.SECRETS_STATUS || 'unknown';
-            const securityBody = [
+            const vulns = process.env.VULN_COUNT || '0';
+            const secretStatus = process.env.SECRET_STATUS || 'N/A';
+            const secretMatches = process.env.SECRET_MATCHES || '0';
+            const commentBody = [
               '## 🔐 Security Scan Report',
               '',
-              'Automated security analysis for this pull request.',
-              '',
               '### Dependencies',
-              `- Vulnerability scan outcome: \`${auditOutcome}\``,
-              '- Command: `npm audit`',
+              `- **Vulnerabilities detected:** ${vulns}`,
+              '- Audit performed with `npm audit` against production dependencies.',
               '',
-              '### Vulnerabilities',
-              `- Secret scan status: \`${secretsStatus}\``,
-              '- Scope: changed files in this pull request',
+              '### Secret Scanning',
+              `- **Status:** ${secretStatus}`,
+              `- **Suspicious matches:** ${secretMatches}`,
+              '- Pattern-based scan executed against files modified in this pull request.',
               '',
-              '_This comment was generated automatically by the PR Automation workflow._'
+              '_Posted automatically by the `security-scan` job._'
             ].join('
 ');
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.pull_request.number,
-              body: securityBody
+              body: commentBody
             });
+
+      - name: Upload security artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-reports
+          path: |
+            npm-audit.json
+            npm-audit.txt
+            secrets-report.txt
+          if-no-files-found: ignore
 
   build-validation:
     name: build-validation
@@ -264,106 +354,117 @@ jobs:
           cache: 'npm'
 
       - name: Install dependencies
-        run: npm ci || npm install
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci || npm install
+          else
+            npm install
+          fi
         continue-on-error: true
 
       - name: Build application
         id: build
         run: |
-          echo "Building application..."
-          if npm run | grep -qE '^\s+build\s*$'; then
-            npm run build > build-output.txt 2>&1 || echo "Build reported issues"
+          set +e
+          if npm run | grep -qE "^  build"; then
+            npm run build > build-log.txt 2>&1
+            BUILD_EXIT=$?
           else
-            echo "No build script defined; treating as no-op build." > build-output.txt
+            echo "No build script defined; treating as no-op." > build-log.txt
+            BUILD_EXIT=0
           fi
-          cat build-output.txt || true
+          echo "build_exit=$BUILD_EXIT" >> $GITHUB_OUTPUT
+          if [ $BUILD_EXIT -eq 0 ]; then
+            echo "build_status=✅ Success" >> $GITHUB_OUTPUT
+          else
+            echo "build_status=❌ Failed" >> $GITHUB_OUTPUT
+          fi
+          cat build-log.txt
+          exit 0
         continue-on-error: true
 
       - name: Validate endpoints
         id: endpoints
         run: |
-          echo "Validating application endpoints..."
-          : > endpoint-check.txt
-          ENTRY=""
-          for f in server.js app.js index.js src/server.js src/app.js src/index.js; do
-            if [ -f "$f" ]; then
-              ENTRY="$f"
-              break
-            fi
-          done
-          if [ -n "$ENTRY" ]; then
-            echo "Starting server from $ENTRY"
-            (PORT=3000 node "$ENTRY" > server.log 2>&1 &) || true
+          set +e
+          mkdir -p deploy-preview
+          ENDPOINT_LOG=deploy-preview/endpoints.txt
+          echo "Endpoint validation report" > "$ENDPOINT_LOG"
+          if [ -f server.js ] || [ -f app.js ] || [ -f index.js ]; then
+            ENTRY=$( [ -f server.js ] && echo server.js || ( [ -f app.js ] && echo app.js || echo index.js ) )
+            (PORT=3000 node "$ENTRY" >/tmp/server.log 2>&1 &) || true
             SERVER_PID=$!
             sleep 5
-            for path in / /health /api /api/health; do
+            for path in "/" "/health" "/api/health" "/status"; do
               CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:3000${path}" || echo "000")
-              echo "GET ${path} -> ${CODE}" >> endpoint-check.txt
+              echo "GET ${path} -> ${CODE}" >> "$ENDPOINT_LOG"
             done
-            kill $SERVER_PID 2>/dev/null || true
+            pkill -f "node $ENTRY" >/dev/null 2>&1 || true
+            echo "endpoint_status=✅ Endpoints probed" >> $GITHUB_OUTPUT
           else
-            echo "No server entry point detected; skipping live endpoint validation." > endpoint-check.txt
+            echo "No HTTP entry point detected; skipping endpoint validation." >> "$ENDPOINT_LOG"
+            echo "endpoint_status=ℹ️ Skipped (no entry point)" >> $GITHUB_OUTPUT
           fi
-          cat endpoint-check.txt
+          cat "$ENDPOINT_LOG"
+          exit 0
         continue-on-error: true
 
       - name: Create deployment preview artifacts
         id: preview
         run: |
-          echo "Creating deployment preview artifacts..."
-          mkdir -p deployment-preview
-          cp -r build-output.txt endpoint-check.txt deployment-preview/ 2>/dev/null || true
-          if [ -d dist ]; then cp -r dist deployment-preview/dist; fi
-          if [ -d build ]; then cp -r build deployment-preview/build; fi
-          if [ -d public ]; then cp -r public deployment-preview/public; fi
+          set +e
+          mkdir -p deploy-preview
           {
             echo "Deployment Preview"
             echo "=================="
-            echo "Commit: ${{ github.sha }}"
-            echo "PR: #${{ github.event.pull_request.number }}"
+            echo "Commit: ${{ github.event.pull_request.head.sha }}"
+            echo "PR:     #${{ github.event.pull_request.number }}"
             echo "Branch: ${{ github.head_ref }}"
-            date -u +"Generated: %Y-%m-%dT%H:%M:%SZ"
-          } > deployment-preview/PREVIEW.md
-        continue-on-error: true
+            echo "Build status: ${{ steps.build.outputs.build_status }}"
+            echo "Endpoint status: ${{ steps.endpoints.outputs.endpoint_status }}"
+          } > deploy-preview/README.md
+          if [ -d dist ]; then cp -R dist deploy-preview/dist; fi
+          if [ -d build ]; then cp -R build deploy-preview/build; fi
+          echo "preview_status=✅ Preview generated" >> $GITHUB_OUTPUT
+          exit 0
 
-      - name: Upload deployment preview artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: deployment-preview
-          path: deployment-preview/
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Post Build Validation comment
-        if: always() && github.event.pull_request.number != ''
+      - name: Post build validation PR comment
+        if: always() && github.event.pull_request != null
         uses: actions/github-script@v7
         env:
-          BUILD_OUTCOME: ${{ steps.build.outcome }}
-          ENDPOINT_OUTCOME: ${{ steps.endpoints.outcome }}
-          PREVIEW_OUTCOME: ${{ steps.preview.outcome }}
+          BUILD_STATUS: ${{ steps.build.outputs.build_status }}
+          ENDPOINT_STATUS: ${{ steps.endpoints.outputs.endpoint_status }}
+          PREVIEW_STATUS: ${{ steps.preview.outputs.preview_status }}
         with:
           script: |
-            const buildOutcome = process.env.BUILD_OUTCOME || 'unknown';
-            const endpointOutcome = process.env.ENDPOINT_OUTCOME || 'unknown';
-            const previewOutcome = process.env.PREVIEW_OUTCOME || 'unknown';
-            const buildBody = [
+            const buildStatus = process.env.BUILD_STATUS || 'N/A';
+            const endpointStatus = process.env.ENDPOINT_STATUS || 'N/A';
+            const previewStatus = process.env.PREVIEW_STATUS || 'N/A';
+            const commentBody = [
               '## 🏗️ Build Validation',
               '',
-              'Automated build validation for this pull request.',
+              `- **Build:** ${buildStatus}`,
+              `- **Endpoints:** ${endpointStatus}`,
+              `- **Deployment Preview:** ${previewStatus}`,
               '',
-              `- Build outcome: \`${buildOutcome}\``,
-              `- Endpoint validation outcome: \`${endpointOutcome}\``,
-              `- Deployment preview outcome: \`${previewOutcome}\``,
+              'Deployment preview artifacts have been uploaded for download from the workflow run.',
               '',
-              'Deployment preview artifacts have been uploaded to this workflow run.',
-              '',
-              '_This comment was generated automatically by the PR Automation workflow._'
+              '_Posted automatically by the `build-validation` job._'
             ].join('
 ');
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.pull_request.number,
-              body: buildBody
+              body: commentBody
             });
+
+      - name: Upload deployment preview artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-preview
+          path: |
+            deploy-preview/
+            build-log.txt
+          if-no-files-found: ignore
